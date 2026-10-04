@@ -29,8 +29,9 @@ scenario by scenario into the test suite.
 ## How it decides
 
 - Every AC edge is recorded: the weekday and minute the charger came out.
-- On unplug the charge-to-full request (if any) is cleared and the profile
-  drops to `power-saver`; on plug-in it goes back to `performance`.
+- On unplug the charge-to-full request (if any) is cleared, the base
+  75-80% thresholds are restored immediately, and the profile drops to
+  `power-saver`; on plug-in it goes back to `performance`.
 - On AC, the ceiling rises to 95-100% when either a charge-to-full request is
   pending or the predicted unplug is within 120 minutes.
 - The prediction takes the lower quartile of recorded unplug minutes, same

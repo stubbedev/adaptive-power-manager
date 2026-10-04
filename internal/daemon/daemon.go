@@ -85,6 +85,18 @@ func Eval(cfg config.Config, log *slog.Logger, now time.Time, pc ProfileClient) 
 			}
 			result.ClearedFullNow = true
 		}
+		// The charge-to-full promise is "the cap comes back when you
+		// unplug": restore the base thresholds now instead of waiting for
+		// the next AC evaluation, mirroring the udev rule this daemon
+		// replaces on distributions without it.
+		if battery, err := sup.Battery(); err == nil && battery != nil && battery.Writable() {
+			if err := battery.SetThresholds(config.BaseStart, config.BaseEnd); err != nil {
+				log.Warn("restoring base charge thresholds", "err", err)
+			} else {
+				result.ThresholdsApplied = true
+				result.Start, result.End = config.BaseStart, config.BaseEnd
+			}
+		}
 	}
 
 	if !onAC {

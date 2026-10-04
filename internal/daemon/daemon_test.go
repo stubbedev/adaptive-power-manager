@@ -215,8 +215,10 @@ func TestFullNowOverridesAndClearsOnUnplug(t *testing.T) {
 	f.writeBattery(t, "95", "100")
 	f.unplug(t)
 	f.eval(t, 2, 17, 10)
-	if got := f.thresholds(t); got != "95/100" {
-		t.Errorf("thresholds = %s, want untouched while on battery", got)
+	// The cap comes back on the unplug edge itself, not at the next AC
+	// evaluation: battery-full's promise is kept immediately.
+	if got := f.thresholds(t); got != "75/80" {
+		t.Errorf("thresholds = %s, want 75/80 restored on the unplug edge", got)
 	}
 	if _, err := os.Stat(f.cfg.FullNowPath()); !os.IsNotExist(err) {
 		t.Error("full-now flag survived the unplug, want removed")
