@@ -1,0 +1,14 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+.direnv
+.pre-commit-config.yaml
+
+# Build output
+/adaptive-power-manager
+/dist/
+
+# Nix
+result
+result-*

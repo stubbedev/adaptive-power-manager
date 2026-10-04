@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o adaptive-power-manager .
+
+      # Real-binary smoke against a fake sysfs tree: the same scenarios the
+      # bash policy's flake check used to cover, now through the CLI. No
+      # system D-Bus in CI, so profile handling is expected to skip.
+      - name: Smoke — policy against a fake sysfs
+        run: |
+          set -euo pipefail
+          BIN="$PWD/adaptive-power-manager"
+          root="$(mktemp -d)"
+          mkdir -p "$root/ps/AC" "$root/ps/BAT0" "$root/state" "$root/run"
+          printf 'Mains'   > "$root/ps/AC/type"
+          printf '1'       > "$root/ps/AC/online"
+          printf 'Battery' > "$root/ps/BAT0/type"
+          printf '75'      > "$root/ps/BAT0/charge_control_start_threshold"
+          printf '80'      > "$root/ps/BAT0/charge_control_end_threshold"
+
+          export APM_SUPPLY_DIR="$root/ps" APM_STATE_DIR="$root/state" APM_RUNTIME_DIR="$root/run"
+
+          out="$("$BIN" status)"
+          echo "$out"
+          echo "$out" | grep -q 'AC:          connected'
+
+          # The predict timing itself is unit-tested with injected clocks;
+          # here we only assert the CLI wiring end to end.
+          printf '1 1020\n1 1035\n1 1005\n1 1050\n' > "$root/state/unplugs"
+          $BIN predict | grep -qE '(at [0-9]{2}:[0-9]{2}|no prediction)'
+
+          "$BIN" full | grep -q 'Charging to 100%'
+          test -e "$root/run/full-now"
+          "$BIN" status | grep -q 'full-now:    true'
+
+          "$BIN" once
+          test "$(cat "$root/state/last-ac")" = 1

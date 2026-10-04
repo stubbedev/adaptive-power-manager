@@ -1,0 +1,28 @@
+[Unit]
+Description=Adaptive battery charging and power profile policy
+Documentation=https://github.com/stubbedev/adaptive-power-manager
+After=power-profiles-daemon.service upower.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/adaptive-power-manager run
+StateDirectory=adaptive-power-manager
+# 0775 so a user CLI can drop the charge-to-full request flag.
+RuntimeDirectory=battery-charge
+RuntimeDirectoryMode=0775
+Restart=on-failure
+RestartSec=10s
+
+# Threshold writes need root; everything else is contained.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/sys/class/power_supply
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

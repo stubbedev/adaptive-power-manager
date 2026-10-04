@@ -1,0 +1,150 @@
+# golangci-lint v2 config, carried over from the other stubbedev Go repos:
+# as strict as this codebase can honestly be. `just lint` gates CI on it;
+# `just lint-fix` autofixes what the linters can.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    # correctness
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - fatcontext
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - goprintffuncname
+    - gosec
+    - iotamixing
+    - makezero
+    - mirror
+    - nilnesserr
+    - noctx
+    - reassign
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wastedassign
+    # modernization
+    - copyloopvar
+    - exptostd
+    - intrange
+    - modernize
+    - perfsprint
+    - prealloc
+    - recvcheck
+    - usestdlibvars
+    - usetesting
+    # style
+    - dupword
+    - errname
+    - gocritic
+    - godot
+    - misspell
+    - nolintlint
+    - predeclared
+    - revive
+    - thelper
+    - whitespace
+
+  settings:
+    staticcheck:
+      # ST1005 (lowercase, unpunctuated error strings) is off: errors here
+      # surface in systemd journals and CLI output, and sentence style is
+      # this codebase's convention. Everything else in staticcheck is on.
+      checks: ["all", "-ST1005"]
+    gocritic: {}
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: bool-literal-in-expr
+        - name: constant-logical-expr
+        - name: context-as-argument
+        # deep-exit is off: this is a binary whose CLI dispatch exits(1) on
+        # fatal misconfiguration — there is no caller to return to.
+        - name: context-keys-type
+        - name: dot-imports
+        - name: early-return
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        # error-strings is off on purpose: errors are user-facing output and
+        # sentence style is this codebase's convention (same call as -ST1005
+        # in staticcheck).
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: var-declaration
+        - name: var-naming
+        - name: waitgroup-by-value
+    misspell:
+      locale: US
+    godot:
+      scope: declarations
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    gosec:
+      excludes:
+        # G104: unhandled errors — errcheck covers this properly.
+        # G204: the only exec'd binary is none; sysfs paths come from the
+        #   environment and are the feature, not a finding.
+        # G304/G703: reading paths from the environment (APM_SUPPLY_DIR and
+        #   friends) is what the test hooks are for.
+        - G104
+        - G204
+        - G304
+        - G703
+
+    # Deliberately NOT enabled, with reasons — reconsider these when the
+    # codebase changes:
+    #   nilnil: Battery() returning (nil, nil) on machines without a battery
+    #     is a documented outcome, not a swallowed error.
+    #   nilerr: the same convention.
+  exclusions:
+    rules:
+      # Test fixtures build fake sysfs trees with fixed content.
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+
+    paths:
+      - vendor
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false

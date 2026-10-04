@@ -1,0 +1,88 @@
+name: Flake
+
+on:
+  push:
+    branches: [master]
+    paths: ['go.mod', 'go.sum', 'flake.nix', 'flake.lock', '**/*.go']
+  pull_request:
+    paths: ['go.mod', 'go.sum', 'flake.nix', 'flake.lock', '**/*.go']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  vendor-hash:
+    runs-on: ubuntu-latest
+    env:
+      XILO_TOKEN: ${{ secrets.XILO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # Substitute from the self-hosted xilo cache. This must be set at
+          # install time: the `xilo use` step later in the job rewrites nix.conf
+          # only after the build has already run, so the cache was previously
+          # written to but never read from.
+          extra-conf: |
+            extra-substituters = https://nix.stubbe.dev/c/default/default
+            extra-trusted-public-keys = default:6uWvXutL9cXjV3lii+Ur5ff+ArQoG4kMBKNXWrIxhHg=
+
+      # Set up the self-hosted xilo cache at nix.stubbe.dev so consumers can
+      # substitute this build instead of rebuilding:
+      #   nix.settings.substituters = [ "https://nix.stubbe.dev/c/default/default" ];
+      # Skipped on PRs from forks, where the secret is unavailable.
+      - uses: stubbedev/xilo@v1
+        if: ${{ env.XILO_TOKEN != '' }}
+        with:
+          url: https://nix.stubbe.dev
+          cache: default
+          token: ${{ secrets.XILO_TOKEN }}
+
+      # Recompute the Go module vendorHash from go.mod/go.sum. Setting it to a
+      # fake value makes `nix build` fail and report the correct one, which we
+      # then write back. Idempotent: a current hash converges to no change.
+      - name: Recompute vendorHash
+        run: |
+          FAKE="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          CUR="$(grep -oP 'vendorHash = "\K[^"]+' flake.nix)"
+          sed -i "s#vendorHash = \"${CUR}\"#vendorHash = \"${FAKE}\"#" flake.nix
+          OUT="$(nix build .#default --no-link 2>&1 || true)"
+          GOT="$(printf '%s' "$OUT" | grep -oP 'got:\s+\K(sha256-\S+)' | head -1 || true)"
+          [ -z "$GOT" ] && GOT="$CUR"
+          sed -i "s#vendorHash = \"${FAKE}\"#vendorHash = \"${GOT}\"#" flake.nix
+          echo "vendorHash = ${GOT}"
+          # A build that fails without reporting a hash (wrong Go toolchain,
+          # broken source) must fail the job instead of silently keeping the
+          # old hash and surfacing later as "no paths to push".
+          if ! nix build .#default --no-link 2>&1 | tail -20; then
+            echo "::error::nix build fails for a reason other than a stale vendorHash"
+            exit 1
+          fi
+
+      - name: Build check (compiles + runs go test via doCheck)
+        run: |
+          set -o pipefail
+          nix build .#default --no-link --print-out-paths | tee /tmp/outpaths
+
+      # attic-action watched the store and uploaded everything realised after
+      # it; xilo pushes explicitly, so name the closure we just built.
+      - name: Push to xilo cache
+        if: ${{ env.XILO_TOKEN != '' }}
+        # A failed push is not swallowed: it would leave every consumer
+        # rebuilding from source, so the step fails the job.
+        run: xilo push default $(cat /tmp/outpaths)
+
+      - name: Commit updated vendorHash
+        if: github.event_name != 'pull_request'
+        run: |
+          if git diff --quiet flake.nix; then
+            echo "vendorHash already current."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add flake.nix
+            git commit -m "chore(nix): update vendorHash [skip ci]"
+            git push
+          fi
