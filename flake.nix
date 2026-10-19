@@ -35,7 +35,7 @@
             # vendorHash is kept current by .github/workflows/flake.yml on any
             # change to go.mod / go.sum. If you bump deps locally, run
             # `just sync-flake` and the correct hash lands here.
-            vendorHash = "sha256-y+3dL8WEiN4PDHLX9/iNijS20wUheiJ+mZrM7af69G0=";
+            vendorHash = "sha256-7WAGXf1vFnCPUxErA5lyF8YNDPyHkn2k1/3G/V6Ylnc=";
 
             # Static pure-Go binary: no cgo, no dynamic resolver, runs on
             # any Linux with the same thresholds contract.
