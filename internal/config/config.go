@@ -43,8 +43,8 @@ const (
 	MinSamples = 3
 	// HistMax caps the unplug log so a stale habit ages out of the model.
 	HistMax = 60
-	// Tick is the daemon's re-evaluation cadence. UPower signals make AC
-	// changes immediate; the tick only catches the prediction boundaries.
+	// Tick is how soon the daemon retries a failed evaluation, and how
+	// often it checks the power source when no UPower signals reach it.
 	Tick = time.Minute
 )
 

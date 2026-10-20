@@ -1,23 +1,28 @@
-// Package daemon wires the evaluation loop and owns the decision: a
-// safety tick, UPower signals and SIGHUP each trigger one idempotent
-// evaluation of power source, profile and charge thresholds.
+// Package daemon runs the power manager: one idempotent, side-effecting
+// evaluation of power source, profile and charge thresholds, driven by
+// events rather than a polling loop.
 package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
 	"github.com/stubbedev/adaptive-power-manager/internal/config"
 	"github.com/stubbedev/adaptive-power-manager/internal/history"
 	"github.com/stubbedev/adaptive-power-manager/internal/predict"
 	"github.com/stubbedev/adaptive-power-manager/internal/profiles"
+	"github.com/stubbedev/adaptive-power-manager/internal/statefile"
 	"github.com/stubbedev/adaptive-power-manager/internal/supply"
 )
 
@@ -28,79 +33,97 @@ type ProfileClient interface {
 	Set(name string) error
 }
 
+var (
+	baseThresholds = supply.Thresholds{Start: config.BaseStart, End: config.BaseEnd}
+	fullThresholds = supply.Thresholds{Start: config.FullStart, End: config.FullEnd}
+)
+
 // Result reports what one evaluation observed and changed.
 type Result struct {
-	OnAC              bool
-	ProfileSet        string
-	RecordedUnplug    bool
-	ClearedFullNow    bool
-	ThresholdsApplied bool
-	Start, End        int
+	OnAC           bool
+	ProfileSet     string
+	RecordedUnplug bool
+	ClearedFullNow bool
+	// Applied holds the thresholds written by this evaluation, nil when
+	// they were already in place or not managed.
+	Applied *supply.Thresholds
+	// Recheck is when the outcome next changes with the passage of time
+	// alone; zero means only an event can change it.
+	Recheck time.Time
 }
 
+// Changed reports whether the evaluation altered any state.
+func (r Result) Changed() bool {
+	return r.ProfileSet != "" || r.RecordedUnplug || r.ClearedFullNow || r.Applied != nil
+}
+
+// LogValue renders the result for structured logs.
+func (r Result) LogValue() slog.Value {
+	attrs := []slog.Attr{
+		slog.Bool("on_ac", r.OnAC),
+		slog.String("profile", r.ProfileSet),
+		slog.Bool("recorded_unplug", r.RecordedUnplug),
+		slog.Bool("cleared_full_now", r.ClearedFullNow),
+	}
+	if r.Applied != nil {
+		attrs = append(attrs, slog.String("thresholds", fmt.Sprintf("%d/%d", r.Applied.Start, r.Applied.End)))
+	}
+	if !r.Recheck.IsZero() {
+		attrs = append(attrs, slog.Time("recheck", r.Recheck))
+	}
+	return slog.GroupValue(attrs...)
+}
+
+// acState is the power source as last recorded, for edge detection.
+type acState byte
+
+const (
+	acUnknown acState = iota
+	acBattery
+	acMains
+)
+
 // Eval performs one evaluation of the policy. It is idempotent: nothing at
-// the wanted state stays untouched, including a profile the user picked by
-// hand between AC edges.
+// the wanted state is touched, including a profile the user picked by hand
+// between AC edges.
 func Eval(cfg config.Config, log *slog.Logger, now time.Time, pc ProfileClient) (Result, error) {
-	dow, minute := clockFields(now)
+	at := history.At(now)
 	sup := supply.Supply{Dir: cfg.SupplyDir}
 
 	onAC, err := sup.OnAC()
 	if err != nil {
 		return Result{}, fmt.Errorf("reading power supplies: %w", err)
 	}
-
-	prev := readLastAC(cfg.LastACPath())
-	cur := "0"
+	cur := acBattery
 	if onAC {
-		cur = "1"
+		cur = acMains
 	}
-	if err := writeLastAC(cfg.LastACPath(), cur); err != nil {
-		return Result{}, fmt.Errorf("recording AC state: %w", err)
+	prev, err := readLastAC(cfg.LastACPath())
+	if err != nil {
+		return Result{}, err
 	}
-	edge := prev != cur
 	result := Result{OnAC: onAC}
 
-	if edge && pc != nil {
-		available, err := pc.Available()
-		if err != nil {
-			log.Warn("listing power profiles", "err", err)
-		} else if want := profiles.Pick(available, onAC); want != "" {
-			if err := pc.Set(want); err != nil {
-				log.Warn("setting power profile", "err", err)
-			} else {
-				result.ProfileSet = want
-			}
+	if prev != cur {
+		if err := writeLastAC(cfg.LastACPath(), cur); err != nil {
+			return result, err
 		}
+		result.ProfileSet = applyProfile(log, pc, onAC)
 	}
 
-	if prev == "1" && cur == "0" {
-		if err := history.Add(cfg.HistoryPath(), history.Entry{Dow: dow, Minute: minute}, config.HistMax); err != nil {
+	if prev == acMains && cur == acBattery {
+		if err := history.Add(cfg.HistoryPath(), at, config.HistMax); err != nil {
 			return result, fmt.Errorf("recording unplug: %w", err)
 		}
 		result.RecordedUnplug = true
-		if fullNowExists(cfg.FullNowPath()) {
-			if err := os.Remove(cfg.FullNowPath()); err != nil {
-				return result, fmt.Errorf("clearing charge-to-full flag: %w", err)
-			}
-			result.ClearedFullNow = true
-		}
 		// The charge-to-full promise is "the cap comes back when you
-		// unplug": restore the base thresholds now instead of waiting for
-		// the next AC evaluation, mirroring the udev rule this daemon
-		// replaces on distributions without it.
-		if battery, err := sup.Battery(); err == nil && battery != nil && battery.Writable() {
-			if err := battery.SetThresholds(config.BaseStart, config.BaseEnd); err != nil {
-				log.Warn("restoring base charge thresholds", "err", err)
-			} else {
-				result.ThresholdsApplied = true
-				result.Start, result.End = config.BaseStart, config.BaseEnd
-			}
+		// unplug": the flag goes with the edge, and the battery branch
+		// below restores the base thresholds right away.
+		cleared, err := removeIfExists(cfg.FullNowPath())
+		if err != nil {
+			return result, fmt.Errorf("clearing charge-to-full flag: %w", err)
 		}
-	}
-
-	if !onAC {
-		return result, nil
+		result.ClearedFullNow = cleared
 	}
 
 	battery, err := sup.Battery()
@@ -111,180 +134,288 @@ func Eval(cfg config.Config, log *slog.Logger, now time.Time, pc ProfileClient) 
 		return result, nil
 	}
 
-	curStart, curEnd, err := battery.Thresholds()
+	want, recheck, err := wantedThresholds(cfg, now, at, onAC)
 	if err != nil {
-		return result, fmt.Errorf("reading charge thresholds: %w", err)
+		return result, err
+	}
+	result.Recheck = recheck
+
+	changed, err := battery.SetThresholds(want)
+	if err != nil {
+		return result, fmt.Errorf("setting charge thresholds: %w", err)
+	}
+	if changed {
+		result.Applied = &want
+	}
+	return result, nil
+}
+
+// wantedThresholds decides the charge thresholds, and when that decision
+// next changes with time alone. On battery the base thresholds hold; on AC
+// the ceiling rises to full for a pending charge-to-full request or while
+// the top-up window before the predicted unplug is open.
+func wantedThresholds(cfg config.Config, now time.Time, at history.Entry, onAC bool) (supply.Thresholds, time.Time, error) {
+	if !onAC {
+		return baseThresholds, time.Time{}, nil
+	}
+	fullNow, err := exists(cfg.FullNowPath())
+	if err != nil {
+		return supply.Thresholds{}, time.Time{}, fmt.Errorf("checking charge-to-full flag: %w", err)
+	}
+	if fullNow {
+		return fullThresholds, time.Time{}, nil
 	}
 
 	entries, err := history.Load(cfg.HistoryPath())
 	if err != nil {
-		return result, fmt.Errorf("reading unplug history: %w", err)
+		return supply.Thresholds{}, time.Time{}, fmt.Errorf("reading unplug history: %w", err)
 	}
 
-	start, end := config.BaseStart, config.BaseEnd
-	switch {
-	case fullNowExists(cfg.FullNowPath()):
-		start, end = config.FullStart, config.FullEnd
-	default:
-		if predicted, ok := predict.Next(entries, dow, minute, config.MinSamples); ok &&
-			predicted-minute <= config.TopupWindowMin {
-			start, end = config.FullStart, config.FullEnd
+	want := baseThresholds
+	if predict.TopUp(entries, at, config.MinSamples, config.TopupWindowMin) {
+		want = fullThresholds
+	}
+
+	// The weekday, and with it the whole prediction, turns over at
+	// midnight even when nothing changes before.
+	year, month, day := now.Date()
+	recheck := time.Date(year, month, day+1, 0, 0, 0, 0, now.Location())
+	if minute, ok := predict.NextChange(entries, at, config.MinSamples, config.TopupWindowMin); ok {
+		recheck = time.Date(year, month, day, minute/60, minute%60, 0, 0, now.Location())
+	}
+	return want, recheck, nil
+}
+
+// applyProfile switches ppd to the profile for the power source and returns
+// it, or "" when nothing was set. Profile trouble never blocks the
+// threshold half of the policy.
+func applyProfile(log *slog.Logger, pc ProfileClient, onAC bool) string {
+	if pc == nil {
+		return ""
+	}
+	available, err := pc.Available()
+	if errors.Is(err, profiles.ErrAbsent) {
+		log.Info("power profile handling unavailable", "err", err)
+		return ""
+	}
+	if err != nil {
+		log.Warn("listing power profiles", "err", err)
+		return ""
+	}
+	want := profiles.Pick(available, onAC)
+	if want == "" {
+		return ""
+	}
+	if err := pc.Set(want); err != nil {
+		log.Warn("setting power profile", "profile", want, "err", err)
+		return ""
+	}
+	return want
+}
+
+// Run evaluates the policy until the context is canceled. It sleeps until
+// something can change the outcome: an AC edge (UPower's OnBattery), a
+// charge-to-full request (inotify on the runtime directory), the next
+// time-based change Eval reports (a wall-clock timer that survives suspend
+// and clock changes), or SIGHUP. Without UPower it falls back to checking
+// the power source every Tick.
+func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
+	migrateLegacyState(cfg, log)
+
+	var pc ProfileClient
+	var acEdges <-chan struct{}
+	conn, err := dbus.ConnectSystemBus()
+	if err != nil {
+		log.Warn("system bus unavailable: no power profiles, polling the power source", "err", err, "every", config.Tick)
+	} else {
+		defer closeLogged(log, "system bus", conn)
+		pc = profiles.New(conn)
+		if acEdges, err = watchOnBattery(conn); err != nil {
+			return err
 		}
 	}
 
-	if start == curStart && end == curEnd {
-		return result, nil
+	requests, err := watchDir(cfg.RuntimeDir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		log.Info("charge-to-full requests unavailable until restart", "dir", cfg.RuntimeDir)
+	case err != nil:
+		return err
+	default:
+		defer closeLogged(log, "runtime directory watch", requests)
 	}
-	if err := battery.SetThresholds(start, end); err != nil {
-		return result, fmt.Errorf("setting charge thresholds: %w", err)
-	}
-	result.ThresholdsApplied = true
-	result.Start, result.End = start, end
-	return result, nil
-}
 
-// Run evaluates the policy on AC changes (UPower signals), every Tick as a
-// safety net for the prediction boundaries, and on SIGHUP, until the
-// context is canceled.
-func Run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
-	pc := connectProfiles(log)
-	wake, err := watchUPower(ctx, log)
+	timer, err := newWallTimer()
 	if err != nil {
 		return err
 	}
-
-	migrateLegacyState(cfg)
+	defer closeLogged(log, "timer", timer)
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
 
-	ticker := time.NewTicker(config.Tick)
-	defer ticker.Stop()
-
-	if _, err := Eval(cfg, log, time.Now(), pc); err != nil {
-		log.Error("evaluating policy", "err", err)
-	}
-
 	for {
+		now := time.Now()
+		result, err := Eval(cfg, log, now, pc)
+		next := result.Recheck
+		switch {
+		case err != nil:
+			log.Error("evaluating policy", "err", err)
+			next = earliest(next, now.Add(config.Tick))
+		case result.Changed():
+			log.Info("applied", "result", result)
+		}
+		if acEdges == nil {
+			next = earliest(next, now.Add(config.Tick))
+		}
+		if err := timer.Arm(next); err != nil {
+			return err
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-		case <-wake:
+		case <-timer.wakes():
+		case <-acEdges:
+		case <-requests.wakes():
 		case <-hup:
 		}
-		if _, err := Eval(cfg, log, time.Now(), pc); err != nil {
-			log.Error("evaluating policy", "err", err)
-		}
 	}
 }
 
-func connectProfiles(log *slog.Logger) ProfileClient {
-	client, err := profiles.Connect()
-	if err != nil {
-		log.Info("power profile handling unavailable", "err", err)
-		return nil
+// earliest returns the earlier of a deadline that may be zero (none) and a
+// fallback.
+func earliest(deadline, fallback time.Time) time.Time {
+	if deadline.IsZero() || fallback.Before(deadline) {
+		return fallback
 	}
-	return client
+	return deadline
 }
 
-// watchUPower subscribes to UPower property changes on the system bus; the
-// OnBattery property flips on every AC edge, making the daemon event-driven
-// rather than a poller. The returned channel closes on context cancellation.
-// A nil channel means "tick only".
-func watchUPower(ctx context.Context, log *slog.Logger) (<-chan struct{}, error) {
-	conn, err := dbus.ConnectSystemBus()
-	if err != nil {
-		log.Info("UPower wakeups unavailable, falling back to the tick", "err", err)
-		return nil, nil
-	}
+// watchOnBattery subscribes to UPower's property changes and signals only
+// those touching OnBattery, which flips on every AC edge; lid and other
+// property changes are not worth an evaluation. The channel stays open
+// until the connection closes.
+func watchOnBattery(conn *dbus.Conn) (<-chan struct{}, error) {
+	const iface = "org.freedesktop.UPower"
 	if err := conn.AddMatchSignal(
-		dbus.WithMatchSender("org.freedesktop.UPower"),
+		dbus.WithMatchSender(iface),
 		dbus.WithMatchObjectPath("/org/freedesktop/UPower"),
 		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchArg(0, iface),
 	); err != nil {
-		if closeErr := conn.Close(); closeErr != nil {
-			log.Warn("closing system bus", "err", closeErr)
-		}
 		return nil, fmt.Errorf("subscribing to UPower signals: %w", err)
 	}
 
-	wake := make(chan struct{}, 1)
 	signals := make(chan *dbus.Signal, 8)
 	conn.Signal(signals)
+	wake := make(chan struct{}, 1)
 	go func() {
-		defer close(wake)
-		defer conn.RemoveSignal(signals)
-		defer func() {
-			if closeErr := conn.Close(); closeErr != nil {
-				log.Warn("closing system bus", "err", closeErr)
-			}
-		}()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-signals:
-				select {
-				case wake <- struct{}{}:
-				default:
-				}
+		for sig := range signals {
+			if touchesOnBattery(sig) {
+				notify(wake)
 			}
 		}
 	}()
 	return wake, nil
 }
 
+// touchesOnBattery reports whether a PropertiesChanged signal changes or
+// invalidates OnBattery.
+func touchesOnBattery(sig *dbus.Signal) bool {
+	const property = "OnBattery"
+	if len(sig.Body) != 3 {
+		return false
+	}
+	if changed, ok := sig.Body[1].(map[string]dbus.Variant); ok {
+		if _, ok := changed[property]; ok {
+			return true
+		}
+	}
+	invalidated, ok := sig.Body[2].([]string)
+	return ok && slices.Contains(invalidated, property)
+}
+
 // migrateLegacyState adopts the unplug history of the replaced bash policy
 // so the prediction does not start blind. It only runs for the default
 // state directory, never for test or user overrides.
-func migrateLegacyState(cfg config.Config) {
+func migrateLegacyState(cfg config.Config, log *slog.Logger) {
 	if cfg.StateDir != config.DefaultStateDir {
 		return
 	}
-	if _, err := os.Stat(cfg.HistoryPath()); err == nil {
+	if _, err := os.Lstat(cfg.HistoryPath()); !errors.Is(err, fs.ErrNotExist) {
 		return
 	}
 	legacy := filepath.Join(config.LegacyStateDir, "unplugs")
-	if _, err := os.Stat(legacy); err != nil {
-		return
-	}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		log.Warn("creating state directory for the legacy history", "dir", cfg.StateDir, "err", err)
 		return
 	}
-	_ = os.Rename(legacy, cfg.HistoryPath())
+	err := os.Rename(legacy, cfg.HistoryPath())
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		log.Warn("adopting the legacy unplug history", "from", legacy, "err", err)
+	default:
+		log.Info("adopted the legacy unplug history", "from", legacy)
+	}
 }
 
-func readLastAC(path string) string {
+func readLastAC(path string) (acState, error) {
 	raw, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return acUnknown, nil
+	}
 	if err != nil {
-		return "unknown"
+		return acUnknown, fmt.Errorf("reading %s: %w", path, err)
 	}
 	switch string(raw) {
 	case "0":
-		return "0"
+		return acBattery, nil
 	case "1":
-		return "1"
+		return acMains, nil
 	default:
-		return "unknown"
+		return acUnknown, nil
 	}
 }
 
-func writeLastAC(path, value string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+func writeLastAC(path string, state acState) error {
+	value := "0"
+	if state == acMains {
+		value = "1"
 	}
-	return os.WriteFile(path, []byte(value), 0o600)
+	if err := statefile.Write(path, []byte(value)); err != nil {
+		return fmt.Errorf("recording AC state: %w", err)
+	}
+	return nil
 }
 
-func fullNowExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func exists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
-func clockFields(now time.Time) (dow, minute int) {
-	dow = (int(now.Weekday())+6)%7 + 1
-	minute = now.Hour()*60 + now.Minute()
-	return dow, minute
+// removeIfExists deletes path and reports whether there was anything to
+// delete.
+func removeIfExists(path string) (bool, error) {
+	err := os.Remove(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+type closer interface {
+	Close() error
+}
+
+func closeLogged(log *slog.Logger, what string, c closer) {
+	if err := c.Close(); err != nil {
+		log.Warn("closing "+what, "err", err)
+	}
 }

@@ -129,15 +129,16 @@ func TestSetThresholdsOrder(t *testing.T) {
 	if !battery.Writable() {
 		t.Fatal("battery should be writable")
 	}
-	if err := battery.SetThresholds(75, 80); err != nil {
-		t.Fatalf("SetThresholds() error = %v", err)
+	want := Thresholds{Start: 75, End: 80}
+	if changed, err := battery.SetThresholds(want); err != nil || !changed {
+		t.Fatalf("SetThresholds() = (%v, %v), want (true, nil)", changed, err)
 	}
-	start, end, err := battery.Thresholds()
+	got, err := battery.Thresholds()
 	if err != nil {
 		t.Fatalf("Thresholds() error = %v", err)
 	}
-	if start != 75 || end != 80 {
-		t.Errorf("Thresholds() = (%d, %d), want (75, 80)", start, end)
+	if got != want {
+		t.Errorf("Thresholds() = %+v, want %+v", got, want)
 	}
 }
 
@@ -147,8 +148,17 @@ func TestSetThresholdsNoopAtTarget(t *testing.T) {
 	batteryFixture(t, dir, "BAT0", "75", "80")
 
 	sup := Supply{Dir: dir}
-	battery, _ := sup.Battery()
-	if err := battery.SetThresholds(75, 80); err != nil {
-		t.Errorf("SetThresholds() at target error = %v", err)
+	battery, err := sup.Battery()
+	if err != nil || battery == nil {
+		t.Fatalf("Battery() = (%v, %v)", battery, err)
+	}
+	// Read-only threshold files prove nothing is written at the target.
+	for _, attr := range []string{startAttr, endAttr} {
+		if err := os.Chmod(filepath.Join(battery.Path, attr), 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if changed, err := battery.SetThresholds(Thresholds{Start: 75, End: 80}); err != nil || changed {
+		t.Errorf("SetThresholds() at target = (%v, %v), want (false, nil)", changed, err)
 	}
 }

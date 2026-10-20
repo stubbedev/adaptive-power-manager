@@ -6,16 +6,29 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/stubbedev/adaptive-power-manager/internal/statefile"
 )
+
+// MinutesPerDay bounds Entry.Minute.
+const MinutesPerDay = 24 * 60
 
 // Entry is one recorded unplug: ISO weekday (1 = Monday .. 7 = Sunday) and
 // minute of the local day.
 type Entry struct {
 	Dow    int
 	Minute int
+}
+
+// At places t on the local weekly clock the history is recorded in.
+func At(t time.Time) Entry {
+	return Entry{
+		Dow:    (int(t.Weekday())+6)%7 + 1,
+		Minute: t.Hour()*60 + t.Minute(),
+	}
 }
 
 // Load reads the unplug log. A missing file is an empty history, not an
@@ -56,17 +69,14 @@ func Add(path string, entry Entry, keep int) error {
 	if len(entries) > keep {
 		entries = entries[len(entries)-keep:]
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("creating %s: %w", filepath.Dir(path), err)
-	}
-	var sb strings.Builder
+	buf := make([]byte, 0, len(entries)*len("7 1439\n"))
 	for _, e := range entries {
-		fmt.Fprintf(&sb, "%d %d\n", e.Dow, e.Minute)
+		buf = strconv.AppendInt(buf, int64(e.Dow), 10)
+		buf = append(buf, ' ')
+		buf = strconv.AppendInt(buf, int64(e.Minute), 10)
+		buf = append(buf, '\n')
 	}
-	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
-		return fmt.Errorf("writing %s: %w", path, err)
-	}
-	return nil
+	return statefile.Write(path, buf)
 }
 
 func parse(line string) (Entry, bool) {
@@ -79,7 +89,7 @@ func parse(line string) (Entry, bool) {
 		return Entry{}, false
 	}
 	m, err := strconv.Atoi(minute)
-	if err != nil || m < 0 || m >= 24*60 {
+	if err != nil || m < 0 || m >= MinutesPerDay {
 		return Entry{}, false
 	}
 	return Entry{Dow: d, Minute: m}, true
