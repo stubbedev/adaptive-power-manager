@@ -21,7 +21,7 @@
         "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      version = "0.1.1";
+      version = "0.2.0";
     in
     {
       packages = forAllSystems (
