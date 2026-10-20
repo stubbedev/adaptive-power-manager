@@ -286,3 +286,64 @@ func TestNoProfilesClientStillManagesThresholds(t *testing.T) {
 		t.Errorf("thresholds = %s, want 95/100 without ppd", got)
 	}
 }
+
+func TestRecheckAtWindowOpening(t *testing.T) {
+	f := newFixture(t)
+	f.seedHistory(t, []string{"1 1020", "1 1035", "1 1005", "1 1050"})
+
+	result := f.eval(t, 1, 10, 0)
+
+	// Lower quartile 16:45 minus the 120-minute window: the ceiling has to
+	// rise at 14:45, and nothing earlier can change the outcome.
+	want := time.Date(2026, 1, 5, 14, 45, 0, 0, time.UTC)
+	if !result.Recheck.Equal(want) {
+		t.Errorf("Recheck = %v, want %v", result.Recheck, want)
+	}
+}
+
+func TestRecheckAtMidnightWithoutPrediction(t *testing.T) {
+	f := newFixture(t)
+
+	result := f.eval(t, 1, 16, 0)
+
+	want := time.Date(2026, 1, 6, 0, 0, 0, 0, time.UTC)
+	if !result.Recheck.Equal(want) {
+		t.Errorf("Recheck = %v, want %v when the weekday turns over", result.Recheck, want)
+	}
+}
+
+func TestNoRecheckOnlyEventsMatter(t *testing.T) {
+	f := newFixture(t)
+	f.eval(t, 1, 16, 0)
+
+	f.unplug(t)
+	if result := f.eval(t, 1, 17, 0); !result.Recheck.IsZero() {
+		t.Errorf("Recheck = %v on battery, want none", result.Recheck)
+	}
+
+	f.plug(t)
+	if err := os.WriteFile(f.cfg.FullNowPath(), []byte("now"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result := f.eval(t, 1, 18, 0); !result.Recheck.IsZero() {
+		t.Errorf("Recheck = %v with a charge-to-full request, want none", result.Recheck)
+	}
+}
+
+func TestSteadyStateWritesNothing(t *testing.T) {
+	f := newFixture(t)
+	f.eval(t, 1, 16, 0)
+
+	// A read-only state directory fails any write: an edge-less evaluation
+	// must not rewrite the recorded AC state.
+	state := filepath.Join(f.root, "state")
+	if err := os.Chmod(state, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(state, 0o700) })
+
+	result := f.eval(t, 1, 16, 5)
+	if result.Changed() {
+		t.Errorf("result = %+v, want nothing changed in steady state", result)
+	}
+}

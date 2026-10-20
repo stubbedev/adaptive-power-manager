@@ -10,50 +10,43 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+// ErrAbsent reports that power-profiles-daemon is not on the system bus,
+// which callers treat as "profile handling unavailable", not as a fault.
+var ErrAbsent = errors.New("power-profiles-daemon not found on the system bus")
+
+type endpoint struct {
+	bus   string
+	path  dbus.ObjectPath
+	iface string
+}
+
 // Bus names and object paths, modern first and legacy second: ppd moved to
 // the org.freedesktop.UPower prefix in 0.10 but distros shipped the old
 // net.hadess name for years after.
-var known = []struct {
-	bus   string
-	path  string
-	iface string
-}{
+var known = [...]endpoint{
 	{"org.freedesktop.UPower.PowerProfiles", "/net/hadess/PowerProfiles", "org.freedesktop.UPower.PowerProfiles"},
 	{"net.hadess.PowerProfiles", "/net/hadess/PowerProfiles", "net.hadess.PowerProfiles"},
 }
 
-// Client is a live connection to power-profiles-daemon.
+// Client talks to power-profiles-daemon over a caller-owned bus
+// connection. The daemon is located on first use and again after it
+// disappears, so a ppd that starts late or restarts is picked up without
+// reconnecting.
 type Client struct {
 	conn  *dbus.Conn
-	obj   dbus.BusObject
-	iface string
+	found *endpoint
 }
 
-// Connect opens the system bus and locates power-profiles-daemon. It fails
-// when ppd is absent, which callers should treat as "profile handling
-// unavailable", not fatal.
-func Connect() (*Client, error) {
-	conn, err := dbus.ConnectSystemBus()
-	if err != nil {
-		return nil, fmt.Errorf("connecting to system bus: %w", err)
-	}
-	for _, k := range known {
-		client := &Client{conn: conn, obj: conn.Object(k.bus, dbus.ObjectPath(k.path)), iface: k.iface}
-		if _, err := client.Available(); err == nil {
-			return client, nil
-		}
-	}
-	if err := conn.Close(); err != nil {
-		return nil, fmt.Errorf("closing system bus: %w", err)
-	}
-	return nil, errors.New("power-profiles-daemon not found on the system bus")
+// New returns a client on conn; it does no I/O until first used.
+func New(conn *dbus.Conn) *Client {
+	return &Client{conn: conn}
 }
 
 // Available lists the profiles ppd offers.
 func (c *Client) Available() ([]string, error) {
-	variant, err := c.obj.GetProperty(c.iface + ".Profiles")
+	variant, err := c.property("Profiles")
 	if err != nil {
-		return nil, fmt.Errorf("reading Profiles: %w", err)
+		return nil, err
 	}
 	raw, ok := variant.Value().([]map[string]dbus.Variant)
 	if !ok {
@@ -74,9 +67,9 @@ func (c *Client) Available() ([]string, error) {
 
 // Active returns the name of the active profile.
 func (c *Client) Active() (string, error) {
-	variant, err := c.obj.GetProperty(c.iface + ".ActiveProfile")
+	variant, err := c.property("ActiveProfile")
 	if err != nil {
-		return "", fmt.Errorf("reading ActiveProfile: %w", err)
+		return "", err
 	}
 	name, ok := variant.Value().(string)
 	if !ok {
@@ -87,15 +80,55 @@ func (c *Client) Active() (string, error) {
 
 // Set activates the named profile.
 func (c *Client) Set(name string) error {
+	ep, err := c.locate()
+	if err != nil {
+		return err
+	}
 	// SetProperty passes the value through as-is, so the variant wrapping
 	// that the org.freedesktop.DBus.Properties.Set signature expects is on
 	// us; a raw string makes ppd reject the whole call.
-	return c.obj.SetProperty(c.iface+".ActiveProfile", dbus.MakeVariant(name))
+	if err := c.object(ep).SetProperty(ep.iface+".ActiveProfile", dbus.MakeVariant(name)); err != nil {
+		c.found = nil
+		return fmt.Errorf("setting ActiveProfile to %q on %s: %w", name, ep.bus, err)
+	}
+	return nil
 }
 
-// Close releases the bus connection.
-func (c *Client) Close() error {
-	return c.conn.Close()
+// property reads one ppd property, forgetting the located endpoint when
+// the read fails so the next call searches again.
+func (c *Client) property(name string) (dbus.Variant, error) {
+	ep, err := c.locate()
+	if err != nil {
+		return dbus.Variant{}, err
+	}
+	variant, err := c.object(ep).GetProperty(ep.iface + "." + name)
+	if err != nil {
+		c.found = nil
+		return dbus.Variant{}, fmt.Errorf("reading %s from %s: %w", name, ep.bus, err)
+	}
+	return variant, nil
+}
+
+// locate returns the endpoint ppd answers on, probing the known names when
+// none is remembered.
+func (c *Client) locate() (endpoint, error) {
+	if c.found != nil {
+		return *c.found, nil
+	}
+	errs := make([]error, 0, len(known))
+	for _, ep := range known {
+		if _, err := c.object(ep).GetProperty(ep.iface + ".ActiveProfile"); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", ep.bus, err))
+			continue
+		}
+		c.found = &ep
+		return ep, nil
+	}
+	return endpoint{}, fmt.Errorf("%w: %w", ErrAbsent, errors.Join(errs...))
+}
+
+func (c *Client) object(ep endpoint) dbus.BusObject {
+	return c.conn.Object(ep.bus, ep.path)
 }
 
 // Pick returns the profile to activate for the given power source: full

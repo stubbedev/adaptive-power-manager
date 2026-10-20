@@ -4,7 +4,26 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestAt(t *testing.T) {
+	t.Parallel()
+	loc := time.FixedZone("CEST", 2*60*60)
+	tests := []struct {
+		at   time.Time
+		want Entry
+	}{
+		{time.Date(2026, 1, 5, 16, 0, 0, 0, loc), Entry{Dow: 1, Minute: 960}},
+		{time.Date(2026, 1, 11, 23, 59, 59, 0, loc), Entry{Dow: 7, Minute: 1439}},
+		{time.Date(2026, 1, 7, 0, 0, 0, 0, loc), Entry{Dow: 3, Minute: 0}},
+	}
+	for _, tt := range tests {
+		if got := At(tt.at); got != tt.want {
+			t.Errorf("At(%v) = %+v, want %+v", tt.at, got, tt.want)
+		}
+	}
+}
 
 func TestLoadMissingFileIsEmpty(t *testing.T) {
 	t.Parallel()

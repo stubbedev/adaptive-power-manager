@@ -8,12 +8,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/godbus/dbus/v5"
 
 	"github.com/stubbedev/adaptive-power-manager/internal/config"
 	"github.com/stubbedev/adaptive-power-manager/internal/daemon"
@@ -70,18 +73,26 @@ func dispatch(command string, cfg config.Config, log *slog.Logger) error {
 		defer stop()
 		return daemon.Run(ctx, cfg, log)
 	case "once":
-		result, err := daemon.Eval(cfg, log, time.Now(), connectProfilesForOneShot(log))
-		logEval(log, result)
-		return err
+		return withProfiles(log, func(client *profiles.Client) error {
+			var pc daemon.ProfileClient
+			if client != nil {
+				pc = client
+			}
+			result, err := daemon.Eval(cfg, log, time.Now(), pc)
+			log.Info("evaluated", "result", result)
+			return err
+		})
 	case "full":
 		return requestFull(cfg)
 	case "status":
-		out, err := status(cfg, time.Now())
-		if err != nil {
-			return err
-		}
-		fmt.Print(out)
-		return nil
+		return withProfiles(log, func(client *profiles.Client) error {
+			out, err := status(cfg, time.Now(), client)
+			if err != nil {
+				return err
+			}
+			fmt.Print(out)
+			return nil
+		})
 	case "predict":
 		out, err := showPrediction(cfg, time.Now())
 		if err != nil {
@@ -100,34 +111,30 @@ func dispatch(command string, cfg config.Config, log *slog.Logger) error {
 	}
 }
 
-func logEval(log *slog.Logger, result daemon.Result) {
-	log.Info("evaluated",
-		"on_ac", result.OnAC,
-		"profile", result.ProfileSet,
-		"recorded_unplug", result.RecordedUnplug,
-		"cleared_full_now", result.ClearedFullNow,
-		"thresholds", fmt.Sprintf("%d/%d", result.Start, result.End),
-		"thresholds_applied", result.ThresholdsApplied,
-	)
-}
-
-// connectProfilesForOneShot makes profile handling optional for one-shot
-// invocations: no running ppd must not fail a timer or udev trigger.
-func connectProfilesForOneShot(log *slog.Logger) daemon.ProfileClient {
-	client, err := profiles.Connect()
+// withProfiles runs fn with a power-profiles-daemon client on a fresh
+// system bus connection, or with nil when there is no bus: one-shot
+// commands must not fail on a machine without D-Bus.
+func withProfiles(log *slog.Logger, fn func(*profiles.Client) error) error {
+	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
-		log.Info("power profile handling unavailable", "err", err)
-		return nil
+		log.Info("system bus unavailable, skipping power profiles", "err", err)
+		return fn(nil)
 	}
-	return client
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Warn("closing system bus", "err", err)
+		}
+	}()
+	return fn(profiles.New(conn))
 }
 
 func requestFull(cfg config.Config) error {
-	if _, err := os.Stat(cfg.RuntimeDir); err != nil {
+	path := cfg.FullNowPath()
+	err := os.WriteFile(path, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
+	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%s is missing, is adaptive-power-manager.service running?", cfg.RuntimeDir)
 	}
-	path := cfg.FullNowPath()
-	if err := os.WriteFile(path, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600); err != nil {
+	if err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	fmt.Println("Charging to 100%. The cap comes back when you unplug.")
@@ -136,7 +143,7 @@ func requestFull(cfg config.Config) error {
 
 // status renders the current state. The output accumulates through
 // fmt.Appendf, which cannot fail, so the caller gets one string to print.
-func status(cfg config.Config, now time.Time) (string, error) {
+func status(cfg config.Config, now time.Time, client *profiles.Client) (string, error) {
 	sup := supply.Supply{Dir: cfg.SupplyDir}
 
 	var out []byte
@@ -155,22 +162,17 @@ func status(cfg config.Config, now time.Time) (string, error) {
 		return "", err
 	}
 	if battery != nil {
-		if start, end, err := battery.Thresholds(); err == nil {
-			out = fmt.Appendf(out, "battery:     %s (%d-%d%%)\n", battery.Name, start, end)
+		if thresholds, err := battery.Thresholds(); err == nil {
+			out = fmt.Appendf(out, "battery:     %s (%d-%d%%)\n", battery.Name, thresholds.Start, thresholds.End)
+		} else {
+			out = fmt.Appendf(out, "battery:     %s (thresholds unavailable: %v)\n", battery.Name, err)
 		}
 	}
 
-	if client, err := profiles.Connect(); err == nil {
-		defer func() { _ = client.Close() }()
-		if active, err := client.Active(); err == nil {
-			available, _ := client.Available()
-			out = fmt.Appendf(out, "profile:     %s (available: %v)\n", active, available)
-		}
-	} else {
-		out = fmt.Appendf(out, "profile:     power-profiles-daemon not reachable\n")
-	}
+	out = appendProfile(out, client)
 
-	out = fmt.Appendf(out, "full-now:    %v\n", flagExists(cfg.FullNowPath()))
+	_, err = os.Lstat(cfg.FullNowPath())
+	out = fmt.Appendf(out, "full-now:    %v\n", err == nil)
 
 	entries, err := history.Load(cfg.HistoryPath())
 	if err != nil {
@@ -178,14 +180,29 @@ func status(cfg config.Config, now time.Time) (string, error) {
 	}
 	out = fmt.Appendf(out, "history:     %d unplugs\n", len(entries))
 
-	dow, minute := clockFields(now)
-	if predicted, ok := predict.Next(entries, dow, minute, config.MinSamples); ok {
+	at := history.At(now)
+	if predicted, ok := predict.Next(entries, at, config.MinSamples); ok {
 		out = fmt.Appendf(out, "prediction:  %s at %02d:%02d, top-up window opens %d min before\n",
-			weekday(dow), predicted/60, predicted%60, config.TopupWindowMin)
+			weekday(at.Dow), predicted/60, predicted%60, config.TopupWindowMin)
 	} else {
 		out = fmt.Appendf(out, "prediction:  none yet, holding the base thresholds\n")
 	}
 	return string(out), nil
+}
+
+func appendProfile(out []byte, client *profiles.Client) []byte {
+	if client == nil {
+		return fmt.Appendf(out, "profile:     system bus not reachable\n")
+	}
+	active, err := client.Active()
+	if err != nil {
+		return fmt.Appendf(out, "profile:     %v\n", err)
+	}
+	available, err := client.Available()
+	if err != nil {
+		return fmt.Appendf(out, "profile:     %s (available: %v)\n", active, err)
+	}
+	return fmt.Appendf(out, "profile:     %s (available: %v)\n", active, available)
 }
 
 func showPrediction(cfg config.Config, now time.Time) (string, error) {
@@ -193,26 +210,15 @@ func showPrediction(cfg config.Config, now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dow, minute := clockFields(now)
-	predicted, ok := predict.Next(entries, dow, minute, config.MinSamples)
+	at := history.At(now)
+	predicted, ok := predict.Next(entries, at, config.MinSamples)
 	if !ok {
 		return fmt.Sprintf("no prediction: fewer than %d unplug records ahead of now\n", config.MinSamples), nil
 	}
-	return fmt.Sprintf("%s at %02d:%02d\n", weekday(dow), predicted/60, predicted%60), nil
+	return fmt.Sprintf("%s at %02d:%02d\n", weekday(at.Dow), predicted/60, predicted%60), nil
 }
 
-func flagExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-func clockFields(now time.Time) (dow, minute int) {
-	dow = (int(now.Weekday())+6)%7 + 1
-	minute = now.Hour()*60 + now.Minute()
-	return dow, minute
-}
-
+// weekday names an ISO weekday (1 = Monday .. 7 = Sunday).
 func weekday(dow int) string {
-	names := []string{"", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
-	return names[dow]
+	return time.Weekday(dow % 7).String()
 }

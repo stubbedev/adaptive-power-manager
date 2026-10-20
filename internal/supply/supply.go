@@ -11,6 +11,11 @@ import (
 	"strings"
 )
 
+const (
+	startAttr = "charge_control_start_threshold"
+	endAttr   = "charge_control_end_threshold"
+)
+
 // Supply addresses one sysfs power supply class directory.
 type Supply struct {
 	Dir string
@@ -79,57 +84,63 @@ func (s Supply) batteryNamed(name string) (*Battery, bool) {
 	return &Battery{Name: name, Path: dir}, true
 }
 
+// Thresholds is a battery's charge_control start/end pair, in percent of
+// full capacity.
+type Thresholds struct {
+	Start, End int
+}
+
 // Thresholds reads the current charge_control start and end thresholds.
-func (b Battery) Thresholds() (start, end int, err error) {
-	start, err = b.threshold("charge_control_start_threshold")
+func (b Battery) Thresholds() (Thresholds, error) {
+	start, err := b.threshold(startAttr)
 	if err != nil {
-		return 0, 0, err
+		return Thresholds{}, err
 	}
-	end, err = b.threshold("charge_control_end_threshold")
+	end, err := b.threshold(endAttr)
 	if err != nil {
-		return 0, 0, err
+		return Thresholds{}, err
 	}
-	return start, end, nil
+	return Thresholds{Start: start, End: end}, nil
 }
 
 // Writable reports whether the charge thresholds can be written, which is
 // false on desktops and batteries whose EC does not expose them.
 func (b Battery) Writable() bool {
-	f, err := os.OpenFile(filepath.Join(b.Path, "charge_control_end_threshold"), os.O_WRONLY, 0)
+	f, err := os.OpenFile(filepath.Join(b.Path, endAttr), os.O_WRONLY, 0)
 	if err != nil {
 		return false
 	}
 	return f.Close() == nil
 }
 
-// SetThresholds moves both charge thresholds. The embedded controller
-// rejects a start above the current end, so the end is written first when
-// raising and the start first when lowering.
-func (b Battery) SetThresholds(start, end int) error {
-	curStart, curEnd, err := b.Thresholds()
+// SetThresholds moves both charge thresholds to want and reports whether
+// anything was written. The embedded controller rejects a start above the
+// current end, so the end is written first when raising and the start
+// first when lowering; values already in place are never rewritten.
+func (b Battery) SetThresholds(want Thresholds) (bool, error) {
+	cur, err := b.Thresholds()
 	if err != nil {
-		return fmt.Errorf("reading %s thresholds: %w", b.Name, err)
+		return false, fmt.Errorf("reading %s thresholds: %w", b.Name, err)
 	}
-	if start == curStart && end == curEnd {
-		return nil
+	if cur == want {
+		return false, nil
 	}
-	for _, attr := range Order(curEnd, end) {
-		value := start
-		if attr == "charge_control_end_threshold" {
-			value = end
+	for _, attr := range Order(cur.End, want.End) {
+		value := want.Start
+		if attr == endAttr {
+			value = want.End
 		}
 		path := filepath.Join(b.Path, attr)
 		if err := os.WriteFile(path, []byte(strconv.Itoa(value)), 0o600); err != nil {
-			return fmt.Errorf("writing %s: %w", path, err)
+			return false, fmt.Errorf("writing %s: %w", path, err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // Order returns the two charge_control attributes in the safe write order
 // for moving from curEnd to end.
 func Order(curEnd, end int) [2]string {
-	const startAttr, endAttr = "charge_control_start_threshold", "charge_control_end_threshold"
 	if end > curEnd {
 		return [2]string{endAttr, startAttr}
 	}

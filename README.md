@@ -53,9 +53,13 @@ adaptive-power-manager status    Current state and prediction
 adaptive-power-manager predict   The predicted unplug time
 ```
 
-`run` is event-driven: UPower property changes wake it on every AC edge, a
-60-second tick covers the prediction boundaries, and SIGHUP forces an
-evaluation. No polling of sysfs.
+`run` is event-driven and sleeps until something can change the outcome:
+UPower's `OnBattery` flipping on an AC edge, a `full` request landing in the
+runtime directory (inotify, so it applies at once), or the next minute the
+prediction moves the ceiling, armed on a wall-clock timer that still fires
+on time after a suspend. On battery there is no timer at all. SIGHUP forces
+an evaluation. State is only written when it changes, atomically. Without a
+system bus it falls back to checking the power source once a minute.
 
 Paths can be redirected with `APM_SUPPLY_DIR`, `APM_STATE_DIR` and
 `APM_RUNTIME_DIR`; state carries over from the bash predecessor at
