@@ -25,4 +25,4 @@ RestrictSUIDSGID=true
 LockPersonality=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
