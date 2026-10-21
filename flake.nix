@@ -77,12 +77,15 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
+          # The package's build inputs carry its Go toolchain, so the shell
+          # compiles with exactly the go the flake builds with.
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.apm ];
           packages = [
-            pkgs.go_1_27
             pkgs.gopls
             pkgs.gotools
             pkgs.golangci-lint
             pkgs.just
+            pkgs.git
           ];
         };
       });

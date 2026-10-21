@@ -83,7 +83,7 @@ missing degrades gracefully to whatever remains.
 ## Development
 
 ```
-devenv shell          # go 1.27, gopls, golangci-lint, just
+nix develop           # go 1.27, gopls, golangci-lint, just (or direnv: .envrc)
 just check            # lint + vet + test + build, mirrors CI exactly
 just sync-flake       # recompute flake.nix vendorHash after dep changes
 nix build             # static binary, runs go test via doCheck
