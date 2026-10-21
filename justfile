@@ -26,20 +26,20 @@ build:
 fmt:
     gofmt -w .
 
-# Recompute the Go module vendorHash in flake.nix from go.mod/go.sum, the
+# Recompute the Go module vendorHash in nix/package.nix from go.mod/go.sum, the
 # same way .github/workflows/flake.yml does. Run after any dependency change.
 sync-flake:
     #!/usr/bin/env bash
     set -euo pipefail
     fake="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    cur="$(grep -oP 'vendorHash = "\K[^"]+' flake.nix)"
-    sed -i "s#vendorHash = \"${cur}\"#vendorHash = \"${fake}\"#" flake.nix
+    cur="$(grep -oP 'vendorHash = "\K[^"]+' nix/package.nix)"
+    sed -i "s#vendorHash = \"${cur}\"#vendorHash = \"${fake}\"#" nix/package.nix
     out="$(nix build .#default --no-link 2>&1 || true)"
     got="$(printf '%s' "$out" | grep -oP 'got:\s+\K(sha256-\S+)' | head -1 || true)"
     if [ -z "$got" ]; then
         got="$cur"
     fi
-    sed -i "s#vendorHash = \"${fake}\"#vendorHash = \"${got}\"#" flake.nix
+    sed -i "s#vendorHash = \"${fake}\"#vendorHash = \"${got}\"#" nix/package.nix
     # A build that fails without reporting a hash (wrong Go toolchain,
     # broken source) must fail loudly, not silently keep the old hash: the
     # CI build would then fail anyway, with a much more confusing error.
