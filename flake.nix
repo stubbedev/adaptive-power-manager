@@ -67,14 +67,6 @@
         }
       );
 
-      apps = forAllSystems (pkgs: rec {
-        adaptive-power-manager = {
-          type = "app";
-          program = "${self.packages.${pkgs.system}.adaptive-power-manager}/bin/adaptive-power-manager";
-        };
-        default = adaptive-power-manager;
-      });
-
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           # The package's build inputs carry its Go toolchain, so the shell
