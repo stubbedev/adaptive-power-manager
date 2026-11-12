@@ -1,9 +1,9 @@
 {
   perSystem =
-    { lib, pkgs, ... }:
+    { inputs', lib, pkgs, ... }:
     let
       version = "0.2.0";
-      apm = pkgs.buildGo127Module {
+      apm = (pkgs.buildGoModule.override { go = inputs'.devtools.packages.go; }) {
         pname = "adaptive-power-manager";
         inherit version;
         src = lib.fileset.toSource {
