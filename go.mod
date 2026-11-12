@@ -2,7 +2,7 @@ module github.com/stubbedev/adaptive-power-manager
 
 go 1.27
 
-toolchain go1.27.2
+toolchain go1.27.4
 
 require (
 	github.com/godbus/dbus/v5 v5.2.4
